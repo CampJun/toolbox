@@ -11,8 +11,7 @@ Outputs (under data/):
     .cache/         raw API responses (so re-runs don't burn quota)
 """
 
-from __future__ import annotations
-
+import hashlib
 import json
 import os
 import re
@@ -31,10 +30,13 @@ CACHE = DATA / ".cache"
 DATA.mkdir(exist_ok=True)
 CACHE.mkdir(exist_ok=True)
 
-QUERY = "cum town"
-YEARS = list(range(2016, 2027))  # 2016-01-01 .. 2026-12-31 inclusive on the low end
-PAGES_PER_YEAR = 2                # 2 * 50 = 100 results per year, ~2.2k quota units
-ORDER = "viewCount"               # bias toward "successful" clips, which is the user's metric
+# Two tightened queries: exact-phrase '"cum town"' and the single-token 'cumtown'
+# (commonly used as a hashtag). YouTube tokenizes these differently so they
+# return overlapping but distinct result sets.
+QUERIES = ['"cum town"', "cumtown"]
+YEARS = list(range(2016, 2027))
+PAGES_PER_YEAR = 3                # 11 years * 2 queries * 3 pages = 66 search calls = 6.6k units
+ORDER = "viewCount"
 
 # Episode-number regexes. Cum Town ran ~470 main eps + Patreon-only "bonus"/"premium"
 # episodes with their own numbering; we cap at 1..700 to be safe and tag each match
@@ -81,9 +83,14 @@ def get(path: str, params: dict) -> dict:
     return {}
 
 
-def search_year(year: int) -> list[dict]:
-    """Return raw search items for one year, cached on disk."""
-    cache_file = CACHE / f"search_{year}.json"
+def _query_slug(q: str) -> str:
+    """Stable filename-safe tag for a query string."""
+    return hashlib.md5(q.encode()).hexdigest()[:8]
+
+
+def search_year(query: str, year: int) -> list[dict]:
+    """Return raw search items for (query, year), cached on disk."""
+    cache_file = CACHE / f"search_{_query_slug(query)}_{year}.json"
     if cache_file.exists():
         return json.loads(cache_file.read_text())["items"]
 
@@ -92,7 +99,7 @@ def search_year(year: int) -> list[dict]:
     for _ in range(PAGES_PER_YEAR):
         params = {
             "part": "snippet",
-            "q": QUERY,
+            "q": query,
             "type": "video",
             "maxResults": 50,
             "order": ORDER,
@@ -107,7 +114,7 @@ def search_year(year: int) -> list[dict]:
         if not page_token:
             break
 
-    cache_file.write_text(json.dumps({"items": items}))
+    cache_file.write_text(json.dumps({"query": query, "year": year, "items": items}))
     return items
 
 
@@ -199,12 +206,15 @@ def parse_all(rows: list[dict]) -> tuple[list[list[tuple[str, int]]], set[str]]:
 
 
 def main() -> None:
-    print(f"Searching '{QUERY}' across {len(YEARS)} yearly windows ({PAGES_PER_YEAR} pages each, order={ORDER})...")
+    print(f"Searching {QUERIES} across {len(YEARS)} yearly windows "
+          f"({PAGES_PER_YEAR} pages each, order={ORDER})...")
     all_items: list[dict] = []
-    for year in YEARS:
-        items = search_year(year)
-        print(f"  {year}: {len(items):3d} results")
-        all_items.extend(items)
+    for query in QUERIES:
+        print(f" query: {query}")
+        for year in YEARS:
+            items = search_year(query, year)
+            print(f"   {year}: {len(items):3d} results")
+            all_items.extend(items)
 
     # dedupe by videoId
     seen: dict[str, dict] = {}
