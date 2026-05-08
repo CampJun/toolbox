@@ -36,10 +36,9 @@ YEARS = list(range(2016, 2027))  # 2016-01-01 .. 2026-12-31 inclusive on the low
 PAGES_PER_YEAR = 2                # 2 * 50 = 100 results per year, ~2.2k quota units
 ORDER = "viewCount"               # bias toward "successful" clips, which is the user's metric
 
-# Episode-number regexes. Cum Town ran ~470 eps; we cap at 1..700 to be safe.
-# - SHOW_NAME matches must contain "cum town"/"cumtown" adjacent to the number (always trustworthy).
-# - GENERIC matches ("Episode N", "Ep N", "#N") are only trusted when "cum town"/"cumtown"
-#   appears within PROXIMITY chars - this drops e.g. MSSP "Ep 403" guest appearances.
+# Episode-number regexes. Cum Town ran ~470 main eps + Patreon-only "bonus"/"premium"
+# episodes with their own numbering; we cap at 1..700 to be safe and tag each match
+# as "regular" or "bonus".
 EP_PATTERNS_SHOW_NAME = [
     re.compile(r"(?i)(?:^|[^a-z0-9])(?:cumtown|cum\s*town)\s*[-:#,.]?\s*(?:ep(?:isode)?\.?\s*)?#?\s*(\d{1,4})\b"),
     re.compile(r"(?i)(?:^|[^a-z0-9])ct\s*[-:#]?\s*(\d{1,4})\b"),
@@ -49,9 +48,16 @@ EP_PATTERNS_GENERIC = [
     re.compile(r"(?i)\bep(\d{1,4})\b"),
     re.compile(r"(?<![a-zA-Z0-9])#(\d{1,4})\b"),
 ]
+# Explicit bonus/premium episode markers - "Bonus 11", "Premium Ep 49", "Premium #6",
+# "premium episode 183". Anything matched here is bonus by definition.
+EP_PATTERNS_BONUS = [
+    re.compile(r"(?i)\b(?:bonus|premium)\s*[-:]?\s*(?:ep(?:isode)?\.?\s*)?#?\s*(\d{1,4})\b"),
+]
 CT_MENTION = re.compile(r"(?i)\b(?:cum\s*town|cumtown)\b")
+BONUS_MARKER = re.compile(r"(?i)\b(?:bonus|premium)\b")
 EP_MIN, EP_MAX = 1, 700
-PROXIMITY = 80  # chars - max distance between episode # and "cum town" mention for generic patterns
+PROXIMITY = 80    # max chars between ep # and "cum town" mention for generic patterns
+BONUS_LOOKBACK = 20  # max chars before ep # to look for "bonus"/"premium" marker
 
 
 def api_key() -> str:
@@ -128,56 +134,67 @@ def _valid(n: int) -> bool:
     return EP_MIN <= n <= EP_MAX and not (2016 <= n <= 2030)
 
 
-def parse_show_name(text: str) -> list[int]:
-    """Strong matches: episode # right next to 'cum town' / 'cumtown' / 'CT'.
-    Returns ALL distinct cited episodes (compilation clips often cite several)."""
-    out: list[int] = []
-    seen: set[int] = set()
+def _classify(text: str, ep_start: int) -> str:
+    """Return 'bonus' if 'bonus'/'premium' appears within BONUS_LOOKBACK chars
+    immediately before the episode-# match, else 'regular'."""
+    window = text[max(0, ep_start - BONUS_LOOKBACK):ep_start]
+    return "bonus" if BONUS_MARKER.search(window) else "regular"
+
+
+def find_episodes(text: str, trust: bool) -> list[tuple[str, int]]:
+    """Extract all (kind, episode) pairs from one clip's text.
+    - Explicit "Bonus N" / "Premium N" patterns are always tagged bonus.
+    - Show-name matches (e.g. "Cum Town Episode 36") are accepted directly;
+      kind is determined by lookback for a nearby bonus marker.
+    - Generic "Episode N"/"Ep N"/"#N" matches need either a trusted channel
+      or proximity to a 'cum town' mention; kind via the same lookback rule.
+    """
+    out: set[tuple[str, int]] = set()
+
+    for pat in EP_PATTERNS_BONUS:
+        for m in pat.finditer(text):
+            n = int(m.group(1))
+            if _valid(n):
+                out.add(("bonus", n))
+
     for pat in EP_PATTERNS_SHOW_NAME:
         for m in pat.finditer(text):
             n = int(m.group(1))
-            if _valid(n) and n not in seen:
-                seen.add(n)
-                out.append(n)
-    return out
+            if _valid(n):
+                out.add((_classify(text, m.start()), n))
 
-
-def parse_generic(text: str, trust: bool) -> list[int]:
-    """Generic 'Episode N' / 'Ep N' / '#N' matches. Without trust, each match
-    must be within PROXIMITY chars of a 'cum town' mention."""
-    out: list[int] = []
-    seen: set[int] = set()
     ct_mentions = [m.start() for m in CT_MENTION.finditer(text)] if not trust else None
     for pat in EP_PATTERNS_GENERIC:
         for m in pat.finditer(text):
             n = int(m.group(1))
-            if not _valid(n) or n in seen:
+            if not _valid(n):
                 continue
             if trust or any(abs(p - m.start()) <= PROXIMITY for p in ct_mentions):
-                seen.add(n)
-                out.append(n)
-    return out
+                out.add((_classify(text, m.start()), n))
+
+    return sorted(out, key=lambda kn: (kn[0], kn[1]))
 
 
-def parse_all(rows: list[dict]) -> tuple[list[list[int]], set[str]]:
-    """Two-pass: pass 1 collects all SHOW_NAME matches and learns 'trusted' channels;
-    pass 2 fills in remaining clips with generic matches under trust/proximity."""
-    eps: list[list[int]] = [[] for _ in rows]
+def parse_all(rows: list[dict]) -> tuple[list[list[tuple[str, int]]], set[str]]:
+    """Two-pass: pass 1 finds strong show-name matches to learn 'trusted' channels;
+    pass 2 extracts all (kind, episode) pairs with trust applied."""
     trusted: set[str] = set()
-    for i, r in enumerate(rows):
+    has_strong: list[bool] = []
+    for r in rows:
         text = f"{r['title']}\n{r['description']}"
-        found = parse_show_name(text)
-        if found:
-            eps[i] = found
+        strong = any(_valid(int(m.group(1)))
+                     for pat in EP_PATTERNS_SHOW_NAME for m in pat.finditer(text))
+        has_strong.append(strong)
+        if strong:
             trusted.add(r["channel"])
     for r in rows:
         if CT_MENTION.search(r["channel"]):
             trusted.add(r["channel"])
-    for i, r in enumerate(rows):
-        if eps[i]:
-            continue
+
+    eps: list[list[tuple[str, int]]] = []
+    for r in rows:
         text = f"{r['title']}\n{r['description']}"
-        eps[i] = parse_generic(text, trust=r["channel"] in trusted)
+        eps.append(find_episodes(text, trust=r["channel"] in trusted))
     return eps, trusted
 
 
@@ -218,30 +235,36 @@ def main() -> None:
 
     eps_list, trusted = parse_all(rows)
     for r, eps in zip(rows, eps_list):
-        r["episodes"] = eps                          # list[int]
-        r["episodes_str"] = ";".join(str(e) for e in eps)
+        r["episodes"] = eps                                   # list[(kind, n)]
+        r["regular_eps"] = ";".join(str(n) for k, n in eps if k == "regular")
+        r["bonus_eps"] = ";".join(str(n) for k, n in eps if k == "bonus")
         r["n_episodes"] = len(eps)
     print(f"trusted CT channels: {len(trusted)}")
     multi = sum(1 for r in rows if r["n_episodes"] > 1)
-    print(f"compilations citing 2+ episodes: {multi}")
+    print(f"clips citing 2+ episodes: {multi}")
+    n_bonus = sum(1 for r in rows if r["bonus_eps"])
+    n_reg = sum(1 for r in rows if r["regular_eps"])
+    n_both = sum(1 for r in rows if r["bonus_eps"] and r["regular_eps"])
+    print(f"clips citing regular eps: {n_reg}; bonus eps: {n_bonus}; both: {n_both}")
 
     clips = pd.DataFrame(rows).sort_values("views", ascending=False)
-    # description is bulky and the python-list 'episodes' column doesn't CSV well;
-    # episodes_str (semicolon-delimited) is what we keep.
+    # 'episodes' column holds python tuples - replace with string columns for CSV.
     clips.drop(columns=["description", "episodes"]).to_csv(DATA / "clips.csv", index=False)
 
     parsed = clips[clips["n_episodes"] > 0].copy()
     print(f"clips with at least one parseable episode #: {len(parsed)} / {len(clips)} "
           f"({len(parsed) / max(len(clips), 1):.0%})")
 
-    # Explode: one row per (clip, cited_episode). view_share splits views across
-    # all cited episodes so a 2-ep compilation contributes views/2 to each.
-    exploded = parsed.explode("episodes").rename(columns={"episodes": "episode"})
-    exploded["episode"] = exploded["episode"].astype(int)
+    # Explode: one row per (clip, kind, cited_episode). view_share splits views
+    # across every (kind, ep) pair the clip cites - so a clip citing both bonus 11
+    # and regular 31 contributes views/2 to each.
+    exploded = parsed.explode("episodes")
+    exploded["kind"] = exploded["episodes"].apply(lambda kn: kn[0])
+    exploded["episode"] = exploded["episodes"].apply(lambda kn: int(kn[1]))
     exploded["view_share"] = exploded["views"] / exploded["n_episodes"]
 
     eps = (
-        exploded.groupby("episode")
+        exploded.groupby(["kind", "episode"])
         .agg(total_views=("view_share", "sum"),
              clip_count=("video_id", "count"),
              solo_clip_count=("n_episodes", lambda s: int((s == 1).sum())),
@@ -249,58 +272,62 @@ def main() -> None:
              top_clip_title=("title", lambda s: s.iloc[s.values.argmax()] if len(s) else ""),
              first_published=("published", "min"))
         .reset_index()
-        .sort_values("episode")
+        .sort_values(["kind", "episode"])
     )
     eps["total_views"] = eps["total_views"].round().astype(int)
     eps.to_csv(DATA / "episodes.csv", index=False)
 
-    print("\nTop 15 episodes by total clip views:")
-    print(eps.sort_values("total_views", ascending=False).head(15)
-          [["episode", "total_views", "clip_count", "top_clip_title"]]
-          .to_string(index=False))
+    for kind in ("regular", "bonus"):
+        sub = eps[eps["kind"] == kind]
+        print(f"\nTop 10 {kind} episodes by total clip views ({len(sub)} eps total):")
+        print(sub.sort_values("total_views", ascending=False).head(10)
+              [["episode", "total_views", "clip_count", "top_clip_title"]]
+              .to_string(index=False))
 
     plot(eps)
     print(f"\nWrote {DATA / 'clips.csv'}, {DATA / 'episodes.csv'}, {DATA / 'chart.png'}")
 
 
 def plot(eps: pd.DataFrame) -> None:
-    # Re-index to dense 1..max so rolling means span gaps where no clips were parsed.
-    full = pd.DataFrame({"episode": range(1, int(eps["episode"].max()) + 1)})
-    eps = full.merge(eps, on="episode", how="left").fillna(0)
     window = 15
-    eps["views_roll"] = eps["total_views"].rolling(window, center=True, min_periods=1).mean()
-    eps["count_roll"] = eps["clip_count"].rolling(window, center=True, min_periods=1).mean()
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    def panel(ax_views, ax_count, sub: pd.DataFrame, label: str, color: str):
+        if sub.empty:
+            return
+        max_ep = int(sub["episode"].max())
+        full = pd.DataFrame({"episode": range(1, max_ep + 1)})
+        d = full.merge(sub, on="episode", how="left").fillna(0)
+        d["views_roll"] = d["total_views"].rolling(window, center=True, min_periods=1).mean()
+        d["count_roll"] = d["clip_count"].rolling(window, center=True, min_periods=1).mean()
 
-    # Log scale on top so ep 36's 9.7M doesn't crush everything else.
-    bars = eps["total_views"].replace(0, float("nan"))  # log can't render zeros
-    ax1.bar(eps["episode"], bars, width=1.0, color="#c0392b", alpha=0.55, label="per-episode total")
-    ax1.plot(eps["episode"], eps["views_roll"].replace(0, float("nan")),
-             color="#7f1d1d", linewidth=2.2, label=f"{window}-ep rolling mean")
-    ax1.set_yscale("log")
-    ax1.set_ylabel("total clip views (log scale)")
-    ax1.set_title("Cum Town: YouTube clip views per episode")
-    ax1.grid(axis="y", alpha=0.3, which="both")
-    ax1.legend(loc="upper right")
+        bars = d["total_views"].replace(0, float("nan"))
+        ax_views.bar(d["episode"], bars, width=1.0, color=color, alpha=0.55, label="per-episode total")
+        ax_views.plot(d["episode"], d["views_roll"].replace(0, float("nan")),
+                      color=color, linewidth=2.2, label=f"{window}-ep rolling mean")
+        ax_views.set_yscale("log")
+        ax_views.set_ylabel("total clip views (log)")
+        ax_views.set_title(f"Cum Town {label}: YouTube clip views per episode")
+        ax_views.grid(axis="y", alpha=0.3, which="both")
+        ax_views.legend(loc="upper right", fontsize=8)
+        for _, row in d[d["total_views"] > 0].nlargest(8, "total_views").iterrows():
+            ax_views.annotate(f"#{int(row['episode'])}",
+                              xy=(row["episode"], row["total_views"]),
+                              xytext=(0, 5), textcoords="offset points",
+                              ha="center", fontsize=8)
 
-    nonzero = eps[eps["total_views"] > 0]
-    for _, row in nonzero.nlargest(10, "total_views").iterrows():
-        ax1.annotate(f"#{int(row['episode'])}",
-                     xy=(row["episode"], row["total_views"]),
-                     xytext=(0, 5), textcoords="offset points",
-                     ha="center", fontsize=8)
+        ax_count.bar(d["episode"], d["clip_count"], width=1.0, color=color, alpha=0.5,
+                     label="clips found")
+        ax_count.plot(d["episode"], d["count_roll"], color=color, linewidth=2.2,
+                      label=f"{window}-ep rolling mean")
+        ax_count.set_ylabel("# of clips")
+        ax_count.set_xlabel("episode number")
+        ax_count.set_title(f"Cum Town {label}: distinct clips per episode")
+        ax_count.grid(axis="y", alpha=0.3)
+        ax_count.legend(loc="upper right", fontsize=8)
 
-    ax2.bar(eps["episode"], eps["clip_count"], width=1.0, color="#2c3e50", alpha=0.55,
-            label="clips found")
-    ax2.plot(eps["episode"], eps["count_roll"], color="#0b1f33", linewidth=2.2,
-             label=f"{window}-ep rolling mean")
-    ax2.set_ylabel("# of clips")
-    ax2.set_xlabel("episode number")
-    ax2.set_title("Distinct clips per episode (proxy for memorable moments)")
-    ax2.grid(axis="y", alpha=0.3)
-    ax2.legend(loc="upper right")
-
+    fig, axes = plt.subplots(2, 2, figsize=(18, 9))
+    panel(axes[0][0], axes[1][0], eps[eps["kind"] == "regular"], "(regular feed)", "#c0392b")
+    panel(axes[0][1], axes[1][1], eps[eps["kind"] == "bonus"], "Premium (bonus feed)", "#2980b9")
     fig.tight_layout()
     fig.savefig(DATA / "chart.png", dpi=140)
     plt.close(fig)
